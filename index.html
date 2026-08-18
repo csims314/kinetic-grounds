@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#10151c" />
+    <meta
+      name="description"
+      content="Kinetic Grounds — a terrain-aware third-person locomotion and inverse-kinematics showcase."
+    />
+    <title>Kinetic Grounds</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="world" aria-label="Interactive third-person 3D locomotion demo"></canvas>
+
+      <div id="loading" class="loading" role="status" aria-live="polite">
+        <div class="loading__brand">
+          <span class="eyebrow">MOTION LAB / 01</span>
+          <h1>Kinetic<br />Grounds</h1>
+        </div>
+        <div class="loading__track"><span id="loading-bar"></span></div>
+        <p id="loading-label">INITIALIZING PHYSICS</p>
+      </div>
+
+      <header class="hud hud--top">
+        <div class="brand-lockup">
+          <span class="brand-mark">KG</span>
+          <div>
+            <strong>KINETIC GROUNDS</strong>
+            <small>IK LOCOMOTION LAB</small>
+          </div>
+        </div>
+        <div class="telemetry" aria-live="polite">
+          <div><span>STATE</span><strong id="state">IDLE</strong></div>
+          <div><span>SPEED</span><strong><b id="speed">0.0</b> M/S</strong></div>
+          <div><span>SURFACE</span><strong id="surface">STABLE</strong></div>
+        </div>
+      </header>
+
+      <aside class="route-card">
+        <span class="eyebrow">TEST SEQUENCE</span>
+        <ol>
+          <li class="active"><span>01</span> RESPONSE DECK</li>
+          <li><span>02</span> GRADE + STEP</li>
+          <li><span>03</span> CONTACT CHANNEL</li>
+          <li><span>04</span> AIR CONTROL</li>
+        </ol>
+      </aside>
+
+      <div class="hud hud--bottom">
+        <div class="control-strip">
+          <div><kbd>WASD</kbd><span>MOVE</span></div>
+          <div><kbd>SHIFT</kbd><span>SPRINT</span></div>
+          <div><kbd>CTRL</kbd><span>WALK</span></div>
+          <div><kbd>SPACE</kbd><span>JUMP</span></div>
+          <div><kbd>R</kbd><span>RESET</span></div>
+          <div><kbd>F</kbd><span>FULLSCREEN</span></div>
+          <div><kbd>`</kbd><span>DEBUG</span></div>
+        </div>
+        <button id="capture" type="button">
+          <span class="mouse-icon" aria-hidden="true"></span>
+          <span><strong>ENTER SIMULATION</strong><small>CLICK TO CAPTURE MOUSE</small></span>
+        </button>
+      </div>
+
+      <div id="reticle" aria-hidden="true"><span></span></div>
+      <pre id="debug" class="debug-panel" hidden></pre>
+      <div id="fatal" class="fatal" role="alert" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
