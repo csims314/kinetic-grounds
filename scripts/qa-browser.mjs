@@ -78,7 +78,10 @@ function command(method, params = {}) {
 
 async function evaluate(expression) {
   const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+  if (result.exceptionDetails) {
+    const description = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
+    throw new Error(`${result.exceptionDetails.text}: ${description}`);
+  }
   return result.result.value;
 }
 
@@ -95,9 +98,27 @@ if (!qa?.ready) {
   throw new Error(`Application did not become ready. QA state: ${JSON.stringify(qa)}; exceptions: ${exceptions.join('; ')}`);
 }
 
+await new Promise((resolve) => setTimeout(resolve, 250));
+qa = await evaluate('window.__KINETIC_GROUNDS_QA__');
+
 const initial = structuredClone(qa);
 await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'w', code: 'KeyW', windowsVirtualKeyCode: 87 });
-await new Promise((resolve) => setTimeout(resolve, 1600));
+let locomotionLockObserved = false;
+const locomotionToeSpeedRange = [
+  { minimum: Number.POSITIVE_INFINITY, maximum: 0 },
+  { minimum: Number.POSITIVE_INFINITY, maximum: 0 },
+];
+for (let sampleIndex = 0; sampleIndex < 20; sampleIndex += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const locomotionSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+  locomotionLockObserved ||=
+    locomotionSample.speed > 1.5 && locomotionSample.footDebug?.some((foot) => foot.locked);
+  locomotionSample.footDebug?.forEach((foot, footIndex) => {
+    const range = locomotionToeSpeedRange[footIndex];
+    range.minimum = Math.min(range.minimum, foot.toeSpeed);
+    range.maximum = Math.max(range.maximum, foot.toeSpeed);
+  });
+}
 await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'w', code: 'KeyW', windowsVirtualKeyCode: 87 });
 await new Promise((resolve) => setTimeout(resolve, 300));
 const afterMove = await evaluate('window.__KINETIC_GROUNDS_QA__');
@@ -110,6 +131,7 @@ const afterJump = await evaluate('window.__KINETIC_GROUNDS_QA__');
 await new Promise((resolve) => setTimeout(resolve, 850));
 await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(0, 1.05, 12.35)');
 await new Promise((resolve) => setTimeout(resolve, 350));
+const afterTeleport = await evaluate('window.__KINETIC_GROUNDS_QA__');
 await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'w', code: 'KeyW', windowsVirtualKeyCode: 87 });
 let contactSample = null;
 const contactDeadline = Date.now() + 3_500;
@@ -125,6 +147,22 @@ const afterContactRun = await evaluate('window.__KINETIC_GROUNDS_QA__');
 await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'w', code: 'KeyW', windowsVirtualKeyCode: 87 });
 await new Promise((resolve) => setTimeout(resolve, 100));
 
+// Straddle the edge of the tallest terrain tile: one foot is 0.52 m above the other.
+await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(9.86, 1.58, 2.7)');
+await new Promise((resolve) => setTimeout(resolve, 2_000));
+const unevenTerrainSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+
+// Straddle two calibration treads so the sole probes disagree across a 0.20 m riser.
+await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(0, 1.9, 1.72)');
+await new Promise((resolve) => setTimeout(resolve, 2_000));
+const stairEdgeSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+
+// Move far enough across the edge that the trailing sole loses upper-tread
+// ownership and must settle on the adjacent lower tread.
+await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(0, 1.9, 1.58)');
+await new Promise((resolve) => setTimeout(resolve, 2_000));
+const stairSplitSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+
 const screenshot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
 writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
 
@@ -134,11 +172,49 @@ const movedMeters = Math.hypot(
 );
 const failures = [];
 if (!initial.grounded) failures.push('player did not settle on the spawn deck');
+if (!initial.footDebug?.some((foot) => foot.locked)) failures.push('toe-driven foot locking did not engage at rest');
+if (!locomotionLockObserved) failures.push('toe-driven foot locking did not engage during locomotion');
 if (movedMeters < 2) failures.push(`forward movement was only ${movedMeters.toFixed(2)} m`);
 if (afterJump.grounded || afterJump.position.y <= afterMove.position.y + 0.2) {
   failures.push('jump did not produce an airborne vertical displacement');
 }
 if (!contactSample) failures.push('contextual hand contact did not engage in the contact channel');
+if (!unevenTerrainSample.grounded) failures.push('player did not settle on the uneven-terrain fixture');
+if (unevenTerrainSample.footDebug?.some((foot) => !foot.hasGround || !foot.sourceContact)) {
+  failures.push('both source contacts were not preserved across the split-height terrain');
+}
+if (unevenTerrainSample.footDebug?.some((foot) => foot.weight < 0.7)) {
+  failures.push('both feet did not receive full stance correction on split-height terrain');
+}
+if (unevenTerrainSample.footDebug?.some((foot) => foot.contactError > 0.06)) {
+  failures.push('a toe remained more than 6 cm above its split-height ground plane');
+}
+if (!stairEdgeSample.grounded) failures.push('player did not settle on the stair-edge fixture');
+if (!stairEdgeSample.footDebug?.some((foot) => foot.supportKind === 'ledge' || foot.clearanceBlocked)) {
+  failures.push('stair-edge fixture did not exercise ledge classification or clearance correction');
+}
+if (stairEdgeSample.footDebug?.some((foot) => foot.postSolveBlocked)) {
+  failures.push('a solved shin, ankle, or foot segment still intersected the stair riser');
+}
+if (stairSplitSample.footDebug?.some((foot) => !foot.hasGround || foot.contactError > 0.06)) {
+  failures.push('a foot did not settle cleanly after releasing the upper stair tread');
+}
+const stairToeHeights = stairSplitSample.footDebug?.map((foot) => foot.actualToe.y) ?? [];
+if (stairToeHeights.length !== 2 || Math.abs(stairToeHeights[0] - stairToeHeights[1]) < 0.14) {
+  failures.push('stair release did not place the feet on separate tread heights');
+}
+if (stairSplitSample.footDebug?.some((foot) => foot.postSolveBlocked)) {
+  failures.push('stair release left a solved segment intersecting the riser');
+}
+if (
+  afterTeleport.footDebug?.some(
+    (foot) =>
+      Math.abs(foot.target.x - afterTeleport.position.x) > 2 ||
+      Math.abs(foot.target.z - afterTeleport.position.z) > 2,
+  )
+) {
+  failures.push('a foot lock retained its pre-teleport world-space target');
+}
 if (exceptions.length > 0) failures.push(`browser exceptions: ${exceptions.join('; ')}`);
 
 console.log(
@@ -147,9 +223,15 @@ console.log(
       initial,
       afterMove,
       afterJump,
+      afterTeleport,
       contactSample,
       afterContactRun,
+      unevenTerrainSample,
+      stairEdgeSample,
+      stairSplitSample,
       movedMeters,
+      locomotionLockObserved,
+      locomotionToeSpeedRange,
       consoleMessages,
       exceptions,
       screenshotPath,

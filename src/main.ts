@@ -35,6 +35,7 @@ interface QaSnapshot {
   draws: number;
   triangles: number;
   handDebug: AnimatedCharacter['handDebug'];
+  footDebug: AnimatedCharacter['footDebug'];
 }
 
 const qaWindow = window as Window & {
@@ -176,6 +177,7 @@ async function bootstrap(): Promise<void> {
     qaWindow.__KINETIC_GROUNDS_TELEPORT__ = (x: number, y: number, z: number): void => {
       motor.reset(course.spawn.clone().set(x, y, z));
       snapshot = motor.snapshot();
+      character.resetIK(snapshot);
       cameraRig.reset(snapshot, world, motor.collider);
     };
   }
@@ -226,6 +228,7 @@ async function bootstrap(): Promise<void> {
     if (inputFrame.resetPressed) {
       motor.reset(course.spawn);
       snapshot = motor.snapshot();
+      character.resetIK(snapshot);
       cameraRig.reset(snapshot, world, motor.collider);
     }
 
@@ -252,6 +255,7 @@ async function bootstrap(): Promise<void> {
     ) {
       motor.reset(course.spawn);
       snapshot = motor.snapshot();
+      character.resetIK(snapshot);
       cameraRig.reset(snapshot, world, motor.collider);
     }
 
@@ -273,6 +277,7 @@ async function bootstrap(): Promise<void> {
       draws: renderer.info.render.calls,
       triangles: renderer.info.render.triangles,
       handDebug: character.handDebug,
+      footDebug: character.footDebug,
     };
 
     hudTimer += frameDt;
@@ -300,6 +305,7 @@ bootstrap().catch((error: unknown) => {
     draws: 0,
     triangles: 0,
     handDebug: [],
+    footDebug: [],
   };
   console.error(error);
 });

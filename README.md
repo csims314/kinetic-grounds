@@ -9,7 +9,7 @@ Kinetic Grounds is a browser-based third-person locomotion and inverse-kinematic
 - Camera-relative walking, jogging, sprinting, turning, jumping, falling, and landing.
 - Fixed-step kinematic capsule controller with acceleration, braking, gravity, slope limits, autostep, ground snapping, coyote time, and jump buffering.
 - Authored Quaternius humanoid model with idle, walk, jog, sprint, jump-start, airborne, and landing animations.
-- Terrain-aware foot IK with ground probes, stance locking, pelvis compensation, reach limits, and sole alignment to surface normals.
+- Collision-aware terrain IK with five-point sole sampling, ledge ownership, velocity-filtered contacts, inertialized stance locks, ankle/shin clearance sweeps, bounded pelvis compensation, soft reach limits, heel freedom, and slope-aware foot orientation.
 - Contextual hand IK on tagged walls and waist-height contact surfaces. The solver derives each arm's outward direction from the animated shoulder, so it does not assume a particular rig handedness.
 - Damped third-person camera with mouse orbit, zoom, velocity-aware targeting, pitch limits, and sphere-cast obstruction avoidance.
 - Deterministic low-poly test course covering shallow and rejected slopes, varied stairs, uneven tiles, landings, a contact corridor, jump gaps, and fall recovery.
@@ -23,7 +23,7 @@ Kinetic Grounds is a browser-based third-person locomotion and inverse-kinematic
 | Rendering | Three.js `WebGLRenderer`, authored GLB assets, directional shadows, fog, ACES tone mapping |
 | Physics | `@dimforge/rapier3d-compat` with a position-based kinematic capsule |
 | Animation | Three.js `AnimationMixer` and semantic clip state machine |
-| IK | Custom analytic two-bone limb solver applied after animation sampling |
+| IK | Staged toe-contact pipeline and custom analytic two-bone limb solver applied after animation sampling |
 | Application | Vanilla TypeScript, HTML, and CSS |
 | Tooling | Vite, TypeScript project references, Vitest |
 
@@ -85,7 +85,10 @@ InputController --> CharacterMotor --> Rapier collision correction
                 AnimationMixer base pose
                            |
                            v
-                 Foot IK + hand IK
+       Sole probes + contact filter + inertialized locks
+        Ledge classification + limb clearance sweeps
+                 Pelvis + limb + toe orientation
+                         Hand IK
                            |
                            v
                      Three.js render
@@ -114,15 +117,19 @@ The semantic states are `idle`, `walk`, `jog`, `sprint`, `jumpStart`, `airborne`
 
 ### Foot IK
 
-Foot IK runs after every `AnimationMixer` update:
+Foot IK runs as a weighted modifier stack after every `AnimationMixer` update:
 
-1. Each animated ankle casts downward into the Rapier world while excluding the player capsule.
-2. The hit point and normal produce a terrain-aware ankle target.
-3. Low vertical foot motion identifies a stance phase and locks the planted target in world space.
-4. The pelvis is raised or lowered within configured reach limits.
-5. An analytic hip-knee-ankle solve places the leg using a forward knee pole.
-6. The ankle's calibrated local up axis blends toward the ground normal.
-7. Locks and solver weights fade out during swing, loss of ground, or airborne states.
+1. Five downward probes cover each animated sole at its toe anchor, heel, toe end, inside edge, and outside edge while excluding the player capsule.
+2. Probe hits are grouped by collider and compared by height. A planted or upper surface retains ownership while at least two sole samples support it; one leftover edge sample releases to the surface with meaningful coverage. This delays premature ledge descent without leaving a foot hanging after most of the sole has crossed.
+3. Full three-dimensional toe velocity and height relative to the authored character root generate a five-frame source-contact vote. Terrain height does not suppress a valid stance.
+4. Separate acquisition and release thresholds lock the toe in world space. Cubic inertialization preserves position and velocity continuity when entering or leaving a stance.
+5. The heel target is derived from the current animated toe-to-heel vector, preserving the source pose instead of authoring a second target.
+6. Rapier sphere sweeps validate the animated-ankle-to-target path, knee-to-ankle shin segment, and ankle-to-toe segment. A vertical obstruction raises the candidate pose in bounded increments. Swing legs use a separate 16 cm, partial-weight correction budget so obstacle avoidance cannot create an extreme high-knee pose.
+7. A reach-aware pelvis pass intersects the vertical ranges available to both legs, prefers the animated knee bend, then uses bounded anatomical reserve when split-height terrain requires it. The result is spring-smoothed and independently disableable through `setPelvisIKWeight()`.
+8. An analytic hip-knee-heel solve uses a knee-side axis calibrated from the authored idle pose. It applies full stance weight toward a soft-clamped anatomical endpoint and reports any distance the unscaled skeleton cannot meet.
+9. Ordered ankle and toe passes aim the toe, blend the sole toward the terrain normal, and lift the toe end clear of the surface while retaining heel freedom.
+10. A post-solve penetration check covers the solved shin, ankle, foot, and toe. One bounded corrective re-solve runs immediately; a persistent ledge correction escalates on following frames until the whole chain is clear.
+11. Locks release on contact loss, support-surface loss, excessive separation, airborne state, or high turn rate. `resetIK()` clears all temporal state on reset and teleport.
 
 ### Hand IK
 
@@ -155,7 +162,7 @@ All primary tuning values live in `src/config.ts`:
 | Simulation | Fixed update frequency and spawn position |
 | Motor | Capsule size, gait speeds, acceleration, gravity, jump timing, slopes, autostep |
 | Camera | FOV, pitch, distance, sensitivity, damping, collision radius |
-| IK | Probe range, ankle height, pelvis limits, lock release distance, hand reach |
+| IK | Sole dimensions, support discontinuity thresholds, clearance proxy radii/lift, contact voting, lock hysteresis, inertialization, soft reach, pelvis weighting, orientation, and hand reach |
 | Quality | Maximum pixel ratio and shadow-map resolution |
 
 Course geometry and contact tags are authored in `src/Course.ts`. Animation-to-state mapping and required bone names are defined in `src/AnimatedCharacter.ts`.
@@ -171,6 +178,7 @@ src/Course.ts               Visual course and matching fixed colliders
 src/InputController.ts      Keyboard, pointer lock, mouse orbit, and fullscreen input
 src/ThirdPersonCamera.ts    Follow camera and obstruction avoidance
 src/config.ts               Central tuning values
+src/ik.ts                   Soft reach, contact voting, and cubic inertialization math
 src/main.ts                 Bootstrap, fixed-step loop, HUD, debug and recovery
 src/styles.css              Loading screen, HUD, telemetry, prompts and responsive layout
 ```
@@ -183,11 +191,12 @@ Run the complete static and unit validation:
 npm.cmd run check
 ```
 
-The current suite contains seven tests covering:
+The current suite contains seventeen tests covering:
 
 - Angle wrapping, damping, easing, and planar velocity math.
 - Ground settling, camera-forward acceleration, jumping, and correct `A`/`D` orientation.
 - GLB signatures, authored mesh/skin presence, required humanoid bones, and semantic locomotion clips.
+- IK soft-extension continuity, cubic position/velocity decay, contact-flicker rejection, source-contact classification, reach-aware pelvis bounds, meaningful ledge ownership, single-sample tread release, sole-coverage selection, and coplanar-surface continuity.
 
 Build validation is separate:
 
@@ -195,11 +204,12 @@ Build validation is separate:
 npm.cmd run build
 ```
 
-`scripts/qa-browser.mjs` drives a real headless Chrome session through the DevTools protocol. It waits for the simulation to become grounded, verifies forward movement and jumping, teleports to the development-only contact fixture, confirms live hand IK, records render statistics and browser exceptions, and writes the gameplay screenshot used above.
+`scripts/qa-browser.mjs` drives a real headless Chrome session through the DevTools protocol. It verifies resting and moving toe locks, forward movement, jumping, teleport-safe lock reset, contextual hand IK, both toe contacts while straddling a 0.52 m terrain split, collision-free upper-tread ownership at a stair edge, and clean release onto separate tread heights. It also records render statistics and browser exceptions and writes the gameplay screenshot used above.
 
-When a Vite server is already running, launch the browser automatically with:
+Run Vite on the harness's expected port, then launch Chrome with a DevTools endpoint on port 9223:
 
 ```powershell
+npm.cmd run dev -- --port 4173
 node scripts/qa-browser.mjs http://127.0.0.1:9223 docs/kinetic-grounds-gameplay.png --launch
 ```
 

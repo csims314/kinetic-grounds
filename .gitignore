@@ -5,4 +5,4 @@ dist/
 playwright-report/
 test-results/
 runtime*.png
-devserver.*.log
+devserver*.log
