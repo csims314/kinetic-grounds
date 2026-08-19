@@ -4,9 +4,11 @@ import {
   AnimationClip,
   AnimationMixer,
   Bone,
+  BoxGeometry,
   Group,
   LoopOnce,
   LoopRepeat,
+  Matrix4,
   MathUtils,
   Mesh,
   MeshBasicMaterial,
@@ -26,10 +28,13 @@ import {
   hasContactMajority,
   isSourceFootContact,
   selectFootSupport,
-  softClampExtension,
+  solveFootbase,
+  solveLimbReach,
   solvePelvisReachOffset,
   type FootSupportSample,
   type LegReachConstraint,
+  type LimbReachResult,
+  type LimbReachability,
 } from './ik';
 import { damp } from './math';
 
@@ -57,6 +62,17 @@ interface Limb {
   root: Bone;
   middle: Bone;
   end: Bone;
+  upperLength: number;
+  lowerLength: number;
+  minimumLength: number;
+  maximumLength: number;
+}
+
+interface BonePoseSnapshot {
+  bone: Bone;
+  position: Vector3;
+  quaternion: Quaternion;
+  scale: Vector3;
 }
 
 type SoleProbeRole = 'anchor' | 'heel' | 'toe' | 'inside' | 'outside';
@@ -81,7 +97,16 @@ interface FootRuntime {
   normal: Vector3;
   probeNormal: Vector3;
   lockedNormal: Vector3;
+  forward: Vector3;
+  probeForward: Vector3;
+  lockedForward: Vector3;
   groundPoint: Vector3;
+  animatedHeelContact: Vector3;
+  animatedToeContact: Vector3;
+  inputHeelGround: Vector3;
+  inputToeGround: Vector3;
+  targetHeelGround: Vector3;
+  targetToeGround: Vector3;
   animatedHip: Vector3;
   animatedKnee: Vector3;
   animatedHeel: Vector3;
@@ -98,6 +123,9 @@ interface FootRuntime {
   transitionElapsed: number;
   transitionDuration: number;
   lockedTarget: Vector3;
+  lockedSupportLocalTarget: Vector3;
+  lockedSupportLocalNormal: Vector3;
+  lockedSupportLocalForward: Vector3;
   locked: boolean;
   contactSamples: boolean[];
   contactConfidence: number;
@@ -107,32 +135,40 @@ interface FootRuntime {
   toeClearance: number;
   toeEndClearance: number;
   heelClearance: number;
+  footLength: number;
+  heelToBallLength: number;
+  soleHalfWidth: number;
+  footbaseBalance: number;
   animatedReach: number;
   geometricReach: number;
   unmetReach: number;
+  reachability: LimbReachability;
+  reachWeight: number;
+  extensionRatio: number;
   sourceContact: boolean;
   actualToe: Vector3;
   contactError: number;
   reachConstraint: LegReachConstraint;
   marker: Mesh;
+  heelMarker: Mesh;
+  toeMarker: Mesh;
+  footprintMarker: Mesh;
   hasGround: boolean;
   soleProbes: SoleProbeRuntime[];
   supportColliderHandle: number | null;
   lockedSupportColliderHandle: number | null;
   supportCount: number;
   supportLedge: boolean;
+  footprintShape: RAPIER.Cuboid;
+  footprintSupported: boolean;
+  footprintColliderHandle: number | null;
+  supportIsMoving: boolean;
   supportKind: 'none' | 'continuous' | 'ledge' | 'blocked';
   clearanceLift: number;
   clearanceWeight: number;
   clearanceBlocked: boolean;
   postSolveBlocked: boolean;
   initialized: boolean;
-}
-
-interface SolveResult {
-  reachable: boolean;
-  solvedDistance: number;
-  unmetDistance: number;
 }
 
 interface HandRuntime {
@@ -175,7 +211,6 @@ const _desiredLocalQuaternion = new Quaternion();
 const _inverseQuaternion = new Quaternion();
 const _worldUp = new Vector3(0, 1, 0);
 const _rayOrigin = new Vector3();
-const _toeToHeel = new Vector3();
 const _kneeSide = new Vector3();
 const _bendDirection = new Vector3();
 const _softTarget = new Vector3();
@@ -194,6 +229,16 @@ const _clearanceVelocity = new Vector3();
 const _actualKnee = new Vector3();
 const _actualHeel = new Vector3();
 const _actualToeEnd = new Vector3();
+const _animatedPivot = new Vector3();
+const _groundPivot = new Vector3();
+const _supportTranslation = new Vector3();
+const _supportRotation = new Quaternion();
+const _footprintOrigin = new Vector3();
+const _footprintVelocity = new Vector3();
+const _footprintRotation = new Quaternion();
+const _footprintBasis = new Matrix4();
+const _footprintPoint = new Vector3();
+const _footprintNormal = new Vector3();
 const IDENTITY_ROTATION = { x: 0, y: 0, z: 0, w: 1 } as const;
 
 function requireBone(root: Object3D, name: string): Bone {
@@ -227,6 +272,8 @@ export class AnimatedCharacter {
   private readonly actions = new Map<string, AnimationAction>();
   private readonly feet: FootRuntime[];
   private readonly hands: HandRuntime[];
+  private readonly animatedPose: BonePoseSnapshot[];
+  private readonly animatedPoseByBone: Map<Bone, BonePoseSnapshot>;
   private readonly pelvisConstraints: LegReachConstraint[] = [];
   private activeAction: AnimationAction | null = null;
   private activeState: LocomotionState | null = null;
@@ -329,6 +376,14 @@ export class AnimatedCharacter {
         handMaterial,
       ),
     ];
+    this.animatedPose = [...new Set(Object.values(this.rig))].map((bone) => ({
+      bone,
+      position: bone.position.clone(),
+      quaternion: bone.quaternion.clone(),
+      scale: bone.scale.clone(),
+    }));
+    this.animatedPoseByBone = new Map(this.animatedPose.map((pose) => [pose.bone, pose]));
+    this.captureAnimatedPose();
     this.debugGroup.name = 'IK targets';
     this.debugGroup.visible = false;
     scene.add(this.debugGroup);
@@ -351,12 +406,14 @@ export class AnimatedCharacter {
   }
 
   update(dt: number, motor: MotorSnapshot): void {
+    this.restoreAnimatedPose();
     const footHeight = CONFIG.motor.capsuleHalfHeight + CONFIG.motor.capsuleRadius;
     this.root.position.set(motor.position.x, motor.position.y - footHeight, motor.position.z);
     this.root.rotation.set(0, motor.heading, 0);
     this.playState(motor.state, motor.speed);
     this.mixer.update(dt);
     this.root.updateMatrixWorld(true);
+    this.captureAnimatedPose();
 
     const turnRate = this.headingInitialized
       ? Math.abs(Math.atan2(Math.sin(motor.heading - this.previousHeading), Math.cos(motor.heading - this.previousHeading))) /
@@ -389,6 +446,9 @@ export class AnimatedCharacter {
       foot.lockedSupportColliderHandle = null;
       foot.supportCount = 0;
       foot.supportLedge = false;
+      foot.footprintSupported = false;
+      foot.footprintColliderHandle = null;
+      foot.supportIsMoving = false;
       foot.supportKind = 'none';
       foot.clearanceLift = 0;
       foot.clearanceWeight = 0;
@@ -396,9 +456,15 @@ export class AnimatedCharacter {
       foot.postSolveBlocked = false;
       foot.initialized = false;
       foot.unmetReach = 0;
+      foot.reachability = 'reachable';
+      foot.reachWeight = 1;
+      foot.extensionRatio = 0;
       foot.sourceContact = false;
       foot.contactError = 0;
       foot.marker.visible = false;
+      foot.heelMarker.visible = false;
+      foot.toeMarker.visible = false;
+      foot.footprintMarker.visible = false;
     }
     for (const hand of this.hands) {
       hand.weight = 0;
@@ -425,8 +491,9 @@ export class AnimatedCharacter {
 
   get debugSummary(): string {
     const footWeights = this.feet.map((foot) => foot.weight.toFixed(2)).join(' / ');
+    const reach = this.feet.map((foot) => foot.reachability).join(' / ');
     const handWeights = this.hands.map((hand) => hand.weight.toFixed(2)).join(' / ');
-    return `IK FOOT  ${footWeights}\nIK HAND  ${handWeights}\nPELVIS   ${this.pelvisOffset.toFixed(3)} m`;
+    return `IK FOOT  ${footWeights}\nREACH     ${reach}\nIK HAND  ${handWeights}\nPELVIS   ${this.pelvisOffset.toFixed(3)} m`;
   }
 
   get handDebug(): Array<{
@@ -452,10 +519,15 @@ export class AnimatedCharacter {
     hasGround: boolean;
     toeSpeed: number;
     unmetReach: number;
+    reachability: LimbReachability;
+    extensionRatio: number;
     contactError: number;
     supportColliderHandle: number | null;
     supportCount: number;
     supportLedge: boolean;
+    footprintSupported: boolean;
+    supportIsMoving: boolean;
+    footbaseBalance: number;
     supportKind: FootRuntime['supportKind'];
     clearanceLift: number;
     clearanceWeight: number;
@@ -473,10 +545,15 @@ export class AnimatedCharacter {
       hasGround: foot.hasGround,
       toeSpeed: foot.animatedVelocity.length(),
       unmetReach: foot.unmetReach,
+      reachability: foot.reachability,
+      extensionRatio: foot.extensionRatio,
       contactError: foot.contactError,
       supportColliderHandle: foot.supportColliderHandle,
       supportCount: foot.supportCount,
       supportLedge: foot.supportLedge,
+      footprintSupported: foot.footprintSupported,
+      supportIsMoving: foot.supportIsMoving,
+      footbaseBalance: foot.footbaseBalance,
       supportKind: foot.supportKind,
       clearanceLift: foot.clearanceLift,
       clearanceWeight: foot.clearanceWeight,
@@ -505,6 +582,28 @@ export class AnimatedCharacter {
     const modelPosition = this.root.getWorldPosition(new Vector3());
     const worldQuaternion = end.getWorldQuaternion(new Quaternion());
     const localUpAxis = new Vector3(0, 1, 0).applyQuaternion(worldQuaternion.clone().invert()).normalize();
+    const worldUpAxis = localUpAxis.clone().applyQuaternion(worldQuaternion).normalize();
+    const toeClearance = MathUtils.clamp(toePosition.y - modelPosition.y, 0.008, 0.06);
+    const toeEndClearance = MathUtils.clamp(toeEndPosition.y - modelPosition.y, 0.008, 0.06);
+    const heelClearance = MathUtils.clamp(heelPosition.y - modelPosition.y, 0.045, 0.18);
+    const animatedHeelContact = heelPosition.clone().addScaledVector(worldUpAxis, -heelClearance);
+    const animatedToeContact = toeEndPosition.clone().addScaledVector(worldUpAxis, -toeEndClearance);
+    const measuredForward = animatedToeContact
+      .clone()
+      .sub(animatedHeelContact)
+      .addScaledVector(worldUpAxis, -animatedToeContact.clone().sub(animatedHeelContact).dot(worldUpAxis));
+    const footLength = Math.max(0.12, measuredForward.length());
+    measuredForward.normalize();
+    const heelToBallLength = MathUtils.clamp(
+      toePosition.clone().sub(animatedHeelContact).dot(measuredForward),
+      footLength * 0.35,
+      footLength * 0.9,
+    );
+    const upperLength = rootPosition.distanceTo(middlePosition);
+    const lowerLength = middlePosition.distanceTo(heelPosition);
+    const maximumLength = upperLength + lowerLength - 0.003;
+    const minimumLength = Math.abs(upperLength - lowerLength) + 0.001;
+    const soleHalfWidth = Math.min(CONFIG.ik.soleHalfWidth, footLength * 0.32);
     const rootWorldQuaternion = root.getWorldQuaternion(new Quaternion());
     const chainAxis = heelPosition.clone().sub(rootPosition).normalize();
     const bendDirection = middlePosition
@@ -523,9 +622,22 @@ export class AnimatedCharacter {
     const marker = new Mesh(geometry, markerMaterial);
     marker.renderOrder = 20;
     this.debugGroup.add(marker);
+    const heelMarker = new Mesh(geometry, markerMaterial);
+    const toeMarker = new Mesh(geometry, markerMaterial);
+    heelMarker.scale.setScalar(0.62);
+    toeMarker.scale.setScalar(0.62);
+    heelMarker.renderOrder = 20;
+    toeMarker.renderOrder = 20;
+    this.debugGroup.add(heelMarker, toeMarker);
+    const footprintMarker = new Mesh(
+      new BoxGeometry(soleHalfWidth * 2, CONFIG.ik.footprintHalfThickness * 2, footLength),
+      new MeshBasicMaterial({ color: PALETTE.acid, wireframe: true, depthTest: false }),
+    );
+    footprintMarker.renderOrder = 19;
+    this.debugGroup.add(footprintMarker);
     return {
       side,
-      limb: { root, middle, end },
+      limb: { root, middle, end, upperLength, lowerLength, minimumLength, maximumLength },
       toe,
       toeEnd,
       target: toePosition.clone(),
@@ -535,7 +647,16 @@ export class AnimatedCharacter {
       normal: new Vector3(0, 1, 0),
       probeNormal: new Vector3(0, 1, 0),
       lockedNormal: new Vector3(0, 1, 0),
+      forward: measuredForward.clone(),
+      probeForward: measuredForward.clone(),
+      lockedForward: measuredForward.clone(),
       groundPoint: toePosition.clone().setY(modelPosition.y),
+      animatedHeelContact,
+      animatedToeContact,
+      inputHeelGround: animatedHeelContact.clone(),
+      inputToeGround: animatedToeContact.clone(),
+      targetHeelGround: animatedHeelContact.clone(),
+      targetToeGround: animatedToeContact.clone(),
       animatedHip: rootPosition.clone(),
       animatedKnee: middlePosition.clone(),
       animatedHeel: heelPosition.clone(),
@@ -552,19 +673,28 @@ export class AnimatedCharacter {
       transitionElapsed: 0,
       transitionDuration: 0,
       lockedTarget: toePosition.clone(),
+      lockedSupportLocalTarget: toePosition.clone(),
+      lockedSupportLocalNormal: new Vector3(0, 1, 0),
+      lockedSupportLocalForward: measuredForward.clone(),
       locked: false,
       contactSamples: [],
       contactConfidence: 0,
       weight: 0,
       localUpAxis,
       kneeSideLocal,
-      toeClearance: MathUtils.clamp(toePosition.y - modelPosition.y, 0.008, 0.06),
-      toeEndClearance: MathUtils.clamp(toeEndPosition.y - modelPosition.y, 0.008, 0.06),
-      heelClearance: MathUtils.clamp(heelPosition.y - modelPosition.y, 0.045, 0.18),
+      toeClearance,
+      toeEndClearance,
+      heelClearance,
+      footLength,
+      heelToBallLength,
+      soleHalfWidth,
+      footbaseBalance: 0.5,
       animatedReach: rootPosition.distanceTo(heelPosition),
-      geometricReach:
-        rootPosition.distanceTo(middlePosition) + middlePosition.distanceTo(heelPosition) - 0.003,
+      geometricReach: maximumLength,
       unmetReach: 0,
+      reachability: 'reachable',
+      reachWeight: 1,
+      extensionRatio: 0,
       sourceContact: false,
       actualToe: toePosition.clone(),
       contactError: 0,
@@ -577,6 +707,9 @@ export class AnimatedCharacter {
           rootPosition.distanceTo(middlePosition) + middlePosition.distanceTo(heelPosition) - 0.003,
       },
       marker,
+      heelMarker,
+      toeMarker,
+      footprintMarker,
       hasGround: false,
       soleProbes: (['anchor', 'heel', 'toe', 'inside', 'outside'] as const).map((role) => ({
         role,
@@ -589,6 +722,14 @@ export class AnimatedCharacter {
       lockedSupportColliderHandle: null,
       supportCount: 0,
       supportLedge: false,
+      footprintShape: new RAPIER.Cuboid(
+        soleHalfWidth * CONFIG.ik.footprintWidthScale,
+        CONFIG.ik.footprintHalfThickness,
+        footLength * CONFIG.ik.footprintLengthScale * 0.5,
+      ),
+      footprintSupported: false,
+      footprintColliderHandle: null,
+      supportIsMoving: false,
       supportKind: 'none',
       clearanceLift: 0,
       clearanceWeight: 0,
@@ -607,6 +748,11 @@ export class AnimatedCharacter {
     markerMaterial: MeshBasicMaterial,
   ): HandRuntime {
     const position = end.getWorldPosition(new Vector3());
+    const rootPosition = root.getWorldPosition(new Vector3());
+    const middlePosition = middle.getWorldPosition(new Vector3());
+    const upperLength = rootPosition.distanceTo(middlePosition);
+    const lowerLength = middlePosition.distanceTo(position);
+    const maximumLength = upperLength + lowerLength - 0.003;
     const worldQuaternion = end.getWorldQuaternion(new Quaternion());
     const localPalmAxis = new Vector3(0, 0, 1).applyQuaternion(worldQuaternion.clone().invert()).normalize();
     const marker = new Mesh(geometry, markerMaterial);
@@ -614,7 +760,15 @@ export class AnimatedCharacter {
     this.debugGroup.add(marker);
     return {
       side,
-      limb: { root, middle, end },
+      limb: {
+        root,
+        middle,
+        end,
+        upperLength,
+        lowerLength,
+        minimumLength: Math.abs(upperLength - lowerLength) + 0.001,
+        maximumLength,
+      },
       target: position.clone(),
       normal: new Vector3(0, 0, 1),
       weight: 0,
@@ -650,18 +804,61 @@ export class AnimatedCharacter {
     this.activeState = state;
   }
 
+  private captureAnimatedPose(): void {
+    for (const pose of this.animatedPose) {
+      pose.position.copy(pose.bone.position);
+      pose.quaternion.copy(pose.bone.quaternion);
+      pose.scale.copy(pose.bone.scale);
+    }
+  }
+
+  private restoreAnimatedPose(): void {
+    if (!this.animatedPose) return;
+    for (const pose of this.animatedPose) {
+      pose.bone.position.copy(pose.position);
+      pose.bone.quaternion.copy(pose.quaternion);
+      pose.bone.scale.copy(pose.scale);
+    }
+    this.root.updateMatrixWorld(true);
+  }
+
+  private restoreFootPose(foot: FootRuntime): void {
+    const bones = [foot.limb.root, foot.limb.middle, foot.limb.end, foot.toe];
+    for (const bone of bones) {
+      const pose = this.animatedPoseByBone.get(bone);
+      if (!pose) continue;
+      bone.position.copy(pose.position);
+      bone.quaternion.copy(pose.quaternion);
+      bone.scale.copy(pose.scale);
+    }
+    foot.limb.root.updateWorldMatrix(true, true);
+  }
+
+  private projectToSupportPlane(
+    position: Vector3,
+    planePoint: Vector3,
+    planeNormal: Vector3,
+    target: Vector3,
+  ): Vector3 {
+    const projectedY =
+      planePoint.y -
+      (planeNormal.x * (position.x - planePoint.x) +
+        planeNormal.z * (position.z - planePoint.z)) /
+        Math.max(0.001, planeNormal.y);
+    return target.set(position.x, projectedY, position.z);
+  }
+
   private updateFootIK(dt: number, motor: MotorSnapshot, turnRate: number): void {
     this.probeFootContacts(dt, motor);
     this.updateFootLocks(dt, motor, turnRate);
     this.resolveFootClearance(dt);
     this.solvePelvis(dt);
-    this.solveLegs();
+    this.solveLegs(dt);
   }
 
   private probeFootContacts(dt: number, motor: MotorSnapshot): void {
     const c = CONFIG.ik;
     const safeDt = Math.max(dt, 1 / 240);
-
     for (const foot of this.feet) {
       foot.animatedHip.copy(foot.limb.root.getWorldPosition(_start));
       foot.animatedKnee.copy(foot.limb.middle.getWorldPosition(_middle));
@@ -669,24 +866,21 @@ export class AnimatedCharacter {
       foot.animatedToe.copy(foot.toe.getWorldPosition(_direction));
       foot.animatedToeEnd.copy(foot.toeEnd.getWorldPosition(_desiredMiddle));
       foot.animatedReach = foot.animatedHip.distanceTo(foot.animatedHeel);
-      foot.geometricReach =
-        foot.animatedHip.distanceTo(foot.animatedKnee) +
-        foot.animatedKnee.distanceTo(foot.animatedHeel) -
-        0.003;
+      foot.geometricReach = foot.limb.maximumLength;
 
       if (!foot.initialized) {
-        foot.previousAnimatedPosition.copy(foot.animatedToe);
-        foot.previousInputTarget.copy(foot.animatedToe);
-        foot.target.copy(foot.animatedToe);
-        foot.inputTarget.copy(foot.animatedToe);
+        foot.previousAnimatedPosition.copy(foot.animatedToeEnd);
+        foot.previousInputTarget.copy(foot.animatedToeEnd);
+        foot.target.copy(foot.animatedToeEnd);
+        foot.inputTarget.copy(foot.animatedToeEnd);
         foot.initialized = true;
       }
       foot.animatedVelocity
-        .copy(foot.animatedToe)
+        .copy(foot.animatedToeEnd)
         .sub(foot.previousAnimatedPosition)
         .multiplyScalar(1 / safeDt);
-      foot.previousAnimatedPosition.copy(foot.animatedToe);
-      const sourceHeight = foot.animatedToe.y - this.root.position.y - foot.toeClearance;
+      foot.previousAnimatedPosition.copy(foot.animatedToeEnd);
+      const sourceHeight = foot.animatedToeEnd.y - this.root.position.y - foot.toeEndClearance;
       const rawContact = isSourceFootContact(
         foot.animatedVelocity.length(),
         sourceHeight,
@@ -707,6 +901,8 @@ export class AnimatedCharacter {
           undefined,
           undefined,
           this.playerCollider,
+          undefined,
+          (collider) => this.course.isFootSupport(collider),
         );
         if (!hit || !motor.grounded) continue;
         const point = ray.pointAt(hit.timeOfImpact);
@@ -718,6 +914,42 @@ export class AnimatedCharacter {
           height: point.y,
           normalY: probe.normal.y,
           isAnchor: probe.role === 'anchor',
+        });
+      }
+
+      _footSide.crossVectors(_worldUp, foot.probeForward).normalize();
+      _footprintBasis.makeBasis(_footSide, _worldUp, foot.probeForward);
+      _footprintRotation.setFromRotationMatrix(_footprintBasis).normalize();
+      _footprintOrigin
+        .copy(foot.animatedHeelContact)
+        .lerp(foot.animatedToeContact, 0.5)
+        .addScaledVector(_worldUp, c.footProbeUp);
+      _footprintVelocity.set(0, -c.footProbeLength, 0);
+      const footprintHit = motor.grounded
+        ? this.world.castShape(
+            _footprintOrigin,
+            _footprintRotation,
+            _footprintVelocity,
+            foot.footprintShape,
+            0.006,
+            1,
+            true,
+            undefined,
+            undefined,
+            this.playerCollider,
+            undefined,
+            (collider) => this.course.isFootSupport(collider),
+          )
+        : null;
+      const footprintNormalY = footprintHit?.normal1.y ?? -1;
+      foot.footprintSupported = Boolean(footprintHit && footprintNormalY >= c.minimumSupportNormalY);
+      foot.footprintColliderHandle = foot.footprintSupported ? footprintHit!.collider.handle : null;
+      if (foot.footprintSupported) {
+        supportSamples.push({
+          colliderHandle: footprintHit!.collider.handle,
+          height: footprintHit!.witness1.y,
+          normalY: footprintNormalY,
+          isAnchor: true,
         });
       }
 
@@ -741,7 +973,9 @@ export class AnimatedCharacter {
       foot.hasGround =
         motor.grounded &&
         selection.colliderHandle !== null &&
-        (selection.supportCount >= c.minimumSoleSupportSamples || lockedSupportVisible);
+        (selection.supportCount >= c.minimumSoleSupportSamples ||
+          lockedSupportVisible ||
+          (foot.footprintSupported && foot.footprintColliderHandle === selection.colliderHandle));
 
       if (foot.hasGround && selection.colliderHandle !== null) {
         _supportPoint.set(0, 0, 0);
@@ -753,19 +987,99 @@ export class AnimatedCharacter {
           _supportNormal.add(probe.normal);
           selectedProbeCount += 1;
         }
+        if (
+          footprintHit &&
+          footprintHit.collider.handle === selection.colliderHandle
+        ) {
+          _footprintPoint.set(
+            footprintHit.witness1.x,
+            footprintHit.witness1.y,
+            footprintHit.witness1.z,
+          );
+          _footprintNormal.set(
+            footprintHit.normal1.x,
+            footprintHit.normal1.y,
+            footprintHit.normal1.z,
+          );
+          _supportPoint.add(_footprintPoint);
+          _supportNormal.add(_footprintNormal);
+          selectedProbeCount += 1;
+        }
         _supportPoint.multiplyScalar(1 / Math.max(1, selectedProbeCount));
         _supportNormal.multiplyScalar(1 / Math.max(1, selectedProbeCount)).normalize();
-        const projectedY =
-          _supportPoint.y -
-          (_supportNormal.x * (foot.animatedToe.x - _supportPoint.x) +
-            _supportNormal.z * (foot.animatedToe.z - _supportPoint.z)) /
-            Math.max(0.001, _supportNormal.y);
-        foot.groundPoint.set(foot.animatedToe.x, projectedY, foot.animatedToe.z);
         foot.probeNormal.copy(_supportNormal);
-        foot.inputTarget.copy(foot.groundPoint).addScaledVector(foot.probeNormal, foot.toeClearance);
+
+        this.projectToSupportPlane(
+          foot.animatedHeelContact,
+          _supportPoint,
+          _supportNormal,
+          foot.inputHeelGround,
+        );
+        this.projectToSupportPlane(
+          foot.animatedToeContact,
+          _supportPoint,
+          _supportNormal,
+          foot.inputToeGround,
+        );
+        const heelHeight = _supportNormal.dot(
+          _direction.copy(foot.animatedHeelContact).sub(foot.inputHeelGround),
+        );
+        const toeHeight = _supportNormal.dot(
+          _direction.copy(foot.animatedToeContact).sub(foot.inputToeGround),
+        );
+        const animatedBase = solveFootbase(
+          foot.animatedHeelContact,
+          foot.animatedToeContact,
+          heelHeight,
+          toeHeight,
+          foot.footLength,
+          c.footbaseAlpha,
+          _animatedPivot,
+        );
+        foot.footbaseBalance = animatedBase.balance;
+        this.projectToSupportPlane(animatedBase.pivot, _supportPoint, _supportNormal, _groundPivot);
+        // The character controller deliberately keeps its capsule one skin-width
+        // away from geometry. Project the planted footbase onto the actual
+        // support plane so that clearance is not inherited by the visible rig.
+        foot.inputTarget.copy(_groundPivot);
+
+        foot.probeForward
+          .copy(foot.animatedToeContact)
+          .sub(foot.animatedHeelContact)
+          .addScaledVector(_supportNormal, -_direction.copy(foot.animatedToeContact)
+            .sub(foot.animatedHeelContact)
+            .dot(_supportNormal));
+        if (foot.probeForward.lengthSq() < 0.000001) {
+          foot.probeForward.set(0, 0, 1).applyQuaternion(this.root.quaternion);
+        }
+        foot.probeForward.normalize();
+        foot.inputHeelGround
+          .copy(foot.inputTarget)
+          .addScaledVector(foot.probeForward, -foot.footLength * foot.footbaseBalance);
+        foot.inputToeGround
+          .copy(foot.inputTarget)
+          .addScaledVector(foot.probeForward, foot.footLength * (1 - foot.footbaseBalance));
+        foot.groundPoint
+          .copy(foot.inputHeelGround)
+          .addScaledVector(foot.probeForward, foot.heelToBallLength);
+
+        const supportCollider = this.world.getCollider(selection.colliderHandle);
+        foot.supportIsMoving =
+          supportCollider.parent()?.bodyType() !== RAPIER.RigidBodyType.Fixed;
       } else {
-        foot.inputTarget.copy(foot.animatedToe);
+        const animatedBase = solveFootbase(
+          foot.animatedHeelContact,
+          foot.animatedToeContact,
+          0,
+          0,
+          foot.footLength,
+          c.footbaseAlpha,
+          _animatedPivot,
+        );
+        foot.footbaseBalance = animatedBase.balance;
+        foot.inputTarget.copy(animatedBase.pivot);
         foot.probeNormal.copy(_worldUp);
+        foot.supportIsMoving = false;
       }
 
       foot.contactSamples.push(rawContact);
@@ -787,7 +1101,11 @@ export class AnimatedCharacter {
     foot.limb.end.getWorldQuaternion(_currentWorldQuaternion);
     _footUp.copy(foot.localUpAxis).applyQuaternion(_currentWorldQuaternion).normalize();
     _soleHeel.copy(foot.animatedHeel).addScaledVector(_footUp, -foot.heelClearance);
-    _footForward.copy(foot.animatedToeEnd).sub(_soleHeel);
+    foot.animatedHeelContact.copy(_soleHeel);
+    foot.animatedToeContact
+      .copy(foot.animatedToeEnd)
+      .addScaledVector(_footUp, -foot.toeEndClearance);
+    _footForward.copy(foot.animatedToeContact).sub(_soleHeel);
     _footForward.addScaledVector(_footUp, -_footForward.dot(_footUp));
     if (_footForward.lengthSq() < 0.000001) {
       _footForward.copy(foot.animatedToeEnd).sub(foot.animatedToe);
@@ -795,19 +1113,64 @@ export class AnimatedCharacter {
     }
     if (_footForward.lengthSq() < 0.000001) _footForward.set(0, 0, 1).applyQuaternion(this.root.quaternion);
     _footForward.normalize();
-    _footSide.crossVectors(_footForward, _footUp).normalize();
-    _soleMiddle.copy(_soleHeel).lerp(foot.animatedToeEnd, 0.52);
+    foot.probeForward.copy(_footForward);
+    _footSide.crossVectors(_footUp, _footForward).normalize();
+    _soleMiddle.copy(_soleHeel).lerp(foot.animatedToeContact, 0.52);
 
     for (const probe of foot.soleProbes) {
       if (probe.role === 'anchor') probe.position.copy(foot.animatedToe);
       else if (probe.role === 'heel') probe.position.copy(_soleHeel).addScaledVector(_footForward, 0.018);
-      else if (probe.role === 'toe') probe.position.copy(foot.animatedToeEnd).addScaledVector(_footForward, -0.012);
+      else if (probe.role === 'toe') probe.position.copy(foot.animatedToeContact).addScaledVector(_footForward, -0.012);
       else {
         probe.position
           .copy(_soleMiddle)
-          .addScaledVector(_footSide, probe.role === 'inside' ? CONFIG.ik.soleHalfWidth : -CONFIG.ik.soleHalfWidth);
+          .addScaledVector(_footSide, probe.role === 'inside' ? foot.soleHalfWidth : -foot.soleHalfWidth);
       }
     }
+  }
+
+  private storeFootLockInSupportSpace(foot: FootRuntime): void {
+    if (foot.lockedSupportColliderHandle === null) return;
+    const collider = this.world.getCollider(foot.lockedSupportColliderHandle);
+    const translation = collider.translation();
+    const rotation = collider.rotation();
+    _supportTranslation.set(translation.x, translation.y, translation.z);
+    _supportRotation.set(rotation.x, rotation.y, rotation.z, rotation.w).normalize();
+    _inverseQuaternion.copy(_supportRotation).invert();
+    foot.lockedSupportLocalTarget
+      .copy(foot.lockedTarget)
+      .sub(_supportTranslation)
+      .applyQuaternion(_inverseQuaternion);
+    foot.lockedSupportLocalNormal
+      .copy(foot.lockedNormal)
+      .applyQuaternion(_inverseQuaternion)
+      .normalize();
+    foot.lockedSupportLocalForward
+      .copy(foot.lockedForward)
+      .applyQuaternion(_inverseQuaternion)
+      .normalize();
+  }
+
+  private refreshFootLockFromSupport(foot: FootRuntime): void {
+    if (!foot.locked || foot.lockedSupportColliderHandle === null) return;
+    const collider = this.world.getCollider(foot.lockedSupportColliderHandle);
+    const translation = collider.translation();
+    const rotation = collider.rotation();
+    _supportTranslation.set(translation.x, translation.y, translation.z);
+    _supportRotation.set(rotation.x, rotation.y, rotation.z, rotation.w).normalize();
+    foot.lockedTarget
+      .copy(foot.lockedSupportLocalTarget)
+      .applyQuaternion(_supportRotation)
+      .add(_supportTranslation);
+    foot.lockedNormal
+      .copy(foot.lockedSupportLocalNormal)
+      .applyQuaternion(_supportRotation)
+      .normalize();
+    foot.lockedForward
+      .copy(foot.lockedSupportLocalForward)
+      .applyQuaternion(_supportRotation)
+      .normalize();
+    foot.supportIsMoving = collider.parent()?.bodyType() !== RAPIER.RigidBodyType.Fixed;
   }
 
   private updateFootLocks(dt: number, motor: MotorSnapshot, turnRate: number): void {
@@ -815,10 +1178,20 @@ export class AnimatedCharacter {
 
     for (const foot of this.feet) {
       const wasLocked = foot.locked;
+      this.refreshFootLockFromSupport(foot);
       const sourceReleased =
         foot.contactConfidence < c.contactReleaseThreshold ||
         !foot.hasGround;
-      _direction.copy(foot.animatedToe).sub(foot.lockedTarget);
+      solveFootbase(
+        foot.animatedHeelContact,
+        foot.animatedToeContact,
+        0,
+        0,
+        foot.footLength,
+        c.footbaseAlpha,
+        _animatedPivot,
+      );
+      _direction.copy(_animatedPivot).sub(foot.lockedTarget);
       _direction.addScaledVector(foot.lockedNormal, -_direction.dot(foot.lockedNormal));
       const lockError = _direction.length();
 
@@ -840,7 +1213,9 @@ export class AnimatedCharacter {
         foot.locked = true;
         foot.lockedTarget.copy(foot.inputTarget);
         foot.lockedNormal.copy(foot.probeNormal);
+        foot.lockedForward.copy(foot.probeForward);
         foot.lockedSupportColliderHandle = foot.supportColliderHandle;
+        this.storeFootLockInSupportSpace(foot);
       }
 
       const baseTarget = foot.locked ? foot.lockedTarget : foot.inputTarget;
@@ -853,18 +1228,48 @@ export class AnimatedCharacter {
           foot.locked ? c.lockInertialization : c.unlockInertialization,
         );
       }
-      this.updateFootInertialization(foot, baseTarget, baseVelocity, dt);
+      if (foot.locked && foot.supportIsMoving) {
+        foot.target.copy(baseTarget);
+        foot.outputVelocity.copy(foot.inputVelocity);
+      } else {
+        this.updateFootInertialization(foot, baseTarget, baseVelocity, dt);
+      }
 
       const desiredNormal = foot.locked ? foot.lockedNormal : foot.probeNormal;
-      foot.normal.lerp(desiredNormal, 1 - Math.exp(-c.footSharpness * dt)).normalize();
-      _toeToHeel.copy(foot.animatedHeel).sub(foot.animatedToe);
-      foot.heelTarget.copy(foot.target).add(_toeToHeel);
+      const desiredForward = foot.locked ? foot.lockedForward : foot.probeForward;
+      if (foot.locked && foot.supportIsMoving) {
+        foot.normal.copy(desiredNormal);
+        foot.forward.copy(desiredForward);
+      } else {
+        foot.normal.lerp(desiredNormal, 1 - Math.exp(-c.footSharpness * dt)).normalize();
+        foot.forward.lerp(desiredForward, 1 - Math.exp(-c.footSharpness * dt)).normalize();
+      }
+      foot.forward.addScaledVector(foot.normal, -foot.forward.dot(foot.normal));
+      if (foot.forward.lengthSq() < 0.000001) foot.forward.copy(desiredForward);
+      foot.forward.normalize();
+      foot.targetHeelGround
+        .copy(foot.target)
+        .addScaledVector(foot.forward, -foot.footLength * foot.footbaseBalance);
+      foot.targetToeGround
+        .copy(foot.target)
+        .addScaledVector(foot.forward, foot.footLength * (1 - foot.footbaseBalance));
+      foot.heelTarget.copy(foot.targetHeelGround).addScaledVector(foot.normal, foot.heelClearance);
+
+      foot.heelMarker.position.copy(foot.targetHeelGround);
+      foot.toeMarker.position.copy(foot.targetToeGround);
+      foot.footprintMarker.position.copy(foot.targetHeelGround).lerp(foot.targetToeGround, 0.5);
+      _footSide.crossVectors(foot.normal, foot.forward).normalize();
+      _footprintBasis.makeBasis(_footSide, foot.normal, foot.forward);
+      foot.footprintMarker.quaternion.setFromRotationMatrix(_footprintBasis);
 
       const sprintScale = motor.speed > 6.2 ? 0.72 : 1;
       const targetWeight = foot.hasGround ? foot.contactConfidence * sprintScale : 0;
       foot.weight = damp(foot.weight, targetWeight, foot.locked ? 18 : 11, dt);
       foot.marker.position.copy(foot.target);
       foot.marker.visible = this.debugVisible && foot.hasGround;
+      foot.heelMarker.visible = this.debugVisible && foot.hasGround;
+      foot.toeMarker.visible = this.debugVisible && foot.hasGround;
+      foot.footprintMarker.visible = this.debugVisible && foot.hasGround;
     }
   }
 
@@ -875,6 +1280,19 @@ export class AnimatedCharacter {
       if (!foot.hasGround) {
         foot.clearanceLift = damp(foot.clearanceLift, 0, c.clearanceReleaseSharpness, dt);
         foot.clearanceWeight = damp(foot.clearanceWeight, 0, c.clearanceReleaseSharpness, dt);
+        foot.clearanceBlocked = false;
+        foot.postSolveBlocked = false;
+        continue;
+      }
+
+      // A planted foot is not a swept rigid body. Solving it directly to the
+      // contact plane avoids false positives where the animated-to-target path
+      // crosses a stair riser even though the final leg pose is collision-free.
+      // solveLegs() still validates the resulting shin, ankle, and toe segments
+      // and performs one bounded lift retry when the final pose is truly blocked.
+      if (foot.sourceContact || foot.locked) {
+        foot.clearanceLift = 0;
+        foot.clearanceWeight = 0;
         foot.clearanceBlocked = false;
         foot.postSolveBlocked = false;
         continue;
@@ -928,8 +1346,10 @@ export class AnimatedCharacter {
   }
 
   private isFootClearanceBlocked(foot: FootRuntime, candidateHeel: Vector3): boolean {
-    _toeToHeel.copy(foot.animatedHeel).sub(foot.animatedToe);
-    _candidateToe.copy(candidateHeel).sub(_toeToHeel);
+    _candidateToe
+      .copy(candidateHeel)
+      .addScaledVector(foot.normal, foot.toeClearance - foot.heelClearance)
+      .addScaledVector(foot.forward, foot.heelToBallLength);
     return (
       this.hasBlockingClearanceHit(foot.animatedHeel, candidateHeel, this.ankleClearanceShape) ||
       this.hasBlockingClearanceHit(foot.animatedKnee, candidateHeel, this.shinClearanceShape) ||
@@ -1007,6 +1427,7 @@ export class AnimatedCharacter {
         foot.animatedReach + c.preferredExtensionReserve,
       );
       constraint.maximumLength = foot.geometricReach;
+      constraint.priority = foot.contactConfidence + (foot.locked ? 0.35 : 0);
       this.pelvisConstraints.push(constraint);
     }
 
@@ -1018,9 +1439,28 @@ export class AnimatedCharacter {
     this.root.updateMatrixWorld(true);
   }
 
-  private solveLegs(): void {
+  private solveLegs(dt: number): void {
     for (const foot of this.feet) {
-      const solveWeight = Math.max(foot.weight, foot.clearanceWeight);
+      const hip = foot.limb.root.getWorldPosition(_start);
+      const reach = solveLimbReach(
+        hip.distanceTo(foot.heelTarget),
+        foot.limb.upperLength,
+        foot.limb.lowerLength,
+        foot.geometricReach,
+        CONFIG.ik.extensionSoftness,
+      );
+      foot.reachability = reach.status;
+      foot.extensionRatio = reach.extensionRatio;
+      foot.unmetReach = reach.unmetDistance;
+      foot.reachWeight = damp(
+        foot.reachWeight,
+        reach.status === 'reachable' ? 1 : CONFIG.ik.unreachableMinimumWeight,
+        reach.status === 'reachable'
+          ? CONFIG.ik.reachBlendInSharpness
+          : CONFIG.ik.reachBlendOutSharpness,
+        dt,
+      );
+      const solveWeight = Math.max(foot.weight, foot.clearanceWeight) * foot.reachWeight;
       if (solveWeight < 0.005 || !foot.hasGround) {
         foot.actualToe.copy(foot.animatedToe);
         foot.unmetReach = 0;
@@ -1031,10 +1471,6 @@ export class AnimatedCharacter {
           : 0;
         continue;
       }
-      const rootPose = foot.limb.root.quaternion.clone();
-      const middlePose = foot.limb.middle.quaternion.clone();
-      const endPose = foot.limb.end.quaternion.clone();
-      const toePose = foot.toe.quaternion.clone();
       this.solveLeg(foot, solveWeight);
 
       if (this.isSolvedFootBlocked(foot)) {
@@ -1043,11 +1479,7 @@ export class AnimatedCharacter {
           this.clearanceLiftLimit(foot) - foot.clearanceLift,
         );
         if (retryLift > 0.001) {
-          foot.limb.root.quaternion.copy(rootPose);
-          foot.limb.middle.quaternion.copy(middlePose);
-          foot.limb.end.quaternion.copy(endPose);
-          foot.toe.quaternion.copy(toePose);
-          foot.limb.root.updateWorldMatrix(true, true);
+          this.restoreFootPose(foot);
           foot.heelTarget.addScaledVector(_worldUp, retryLift);
           foot.clearanceLift += retryLift;
           foot.clearanceBlocked = true;
@@ -1084,8 +1516,12 @@ export class AnimatedCharacter {
       foot.reachableHeelTarget,
     );
     foot.unmetReach = solve.unmetDistance;
-    _toeToHeel.copy(foot.animatedHeel).sub(foot.animatedToe);
-    foot.reachableToeTarget.copy(foot.reachableHeelTarget).sub(_toeToHeel);
+    foot.reachability = solve.status;
+    foot.extensionRatio = solve.extensionRatio;
+    foot.reachableToeTarget
+      .copy(foot.reachableHeelTarget)
+      .addScaledVector(foot.normal, foot.toeClearance - foot.heelClearance)
+      .addScaledVector(foot.forward, foot.heelToBallLength);
 
     foot.toe.getWorldPosition(_middle);
     this.rotateBoneTowardWeighted(
@@ -1103,8 +1539,11 @@ export class AnimatedCharacter {
     this.liftToeEnd(foot, solveWeight);
     foot.toe.updateWorldMatrix(true, true);
     foot.actualToe.copy(foot.toe.getWorldPosition(_middle));
+    _groundPivot
+      .copy(foot.targetHeelGround)
+      .addScaledVector(foot.forward, foot.heelToBallLength);
     foot.contactError = Math.abs(
-      foot.normal.dot(_direction.copy(foot.actualToe).sub(foot.groundPoint)) - foot.toeClearance,
+      foot.normal.dot(_direction.copy(foot.actualToe).sub(_groundPivot)) - foot.toeClearance,
     );
   }
 
@@ -1123,7 +1562,7 @@ export class AnimatedCharacter {
   private liftToeEnd(foot: FootRuntime, weight: number): void {
     foot.toe.updateWorldMatrix(true, true);
     foot.toeEnd.getWorldPosition(_end);
-    const height = foot.normal.dot(_direction.copy(_end).sub(foot.groundPoint));
+    const height = foot.normal.dot(_direction.copy(_end).sub(foot.targetToeGround));
     if (height >= foot.toeEndClearance) return;
     _toeEndCorrection.copy(_end).addScaledVector(foot.normal, foot.toeEndClearance - height);
     this.rotateBoneTowardWeighted(foot.toe, _end, _toeEndCorrection, weight * 0.75);
@@ -1190,28 +1629,23 @@ export class AnimatedCharacter {
     weight: number,
     poseMaximumExtension?: number,
     reachableTarget?: Vector3,
-  ): SolveResult {
+  ): LimbReachResult {
     limb.root.updateWorldMatrix(true, true);
     limb.root.getWorldPosition(_start);
     limb.middle.getWorldPosition(_middle);
     limb.end.getWorldPosition(_end);
 
-    const upperLength = _start.distanceTo(_middle);
-    const lowerLength = _middle.distanceTo(_end);
+    const upperLength = limb.upperLength;
+    const lowerLength = limb.lowerLength;
     const requestedDistance = _start.distanceTo(target);
-    const geometricMaximum = upperLength + lowerLength - 0.003;
-    const minimum = Math.abs(upperLength - lowerLength) + 0.001;
-    const maximum = MathUtils.clamp(poseMaximumExtension ?? geometricMaximum, minimum, geometricMaximum);
-    const softenedDistance = softClampExtension(
+    const reach = solveLimbReach(
       requestedDistance,
-      maximum,
+      upperLength,
+      lowerLength,
+      poseMaximumExtension ?? limb.maximumLength,
       CONFIG.ik.extensionSoftness,
     );
-    const distance = MathUtils.clamp(
-      softenedDistance,
-      minimum,
-      geometricMaximum,
-    );
+    const distance = reach.solvedDistance;
     _direction.copy(target).sub(_start).normalize();
     if (_direction.lengthSq() === 0) _direction.copy(_end).sub(_start).normalize();
     _softTarget.copy(_start).addScaledVector(_direction, distance);
@@ -1245,11 +1679,7 @@ export class AnimatedCharacter {
     limb.root.updateWorldMatrix(true, true);
     limb.middle.quaternion.copy(middleAnimated).slerp(middleSolved, solveWeight);
     limb.middle.updateWorldMatrix(true, true);
-    return {
-      reachable: requestedDistance <= maximum,
-      solvedDistance: distance,
-      unmetDistance: Math.max(0, requestedDistance - distance),
-    };
+    return reach;
   }
 
   private rotateBoneTowardWeighted(

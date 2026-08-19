@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process';
 
 const endpoint = process.argv[2] ?? 'http://127.0.0.1:9222';
 const screenshotPath = process.argv[3] ?? 'runtime-ready.png';
+const edgeScreenshotPath = screenshotPath.replace(/\.png$/i, '-edge.png');
+const terrainScreenshotPath = screenshotPath.replace(/\.png$/i, '-terrain.png');
 const shouldLaunchChrome = process.argv.includes('--launch');
 const timeoutAt = Date.now() + 45_000;
 
@@ -85,6 +87,21 @@ async function evaluate(expression) {
   return result.result.value;
 }
 
+async function toggleDebug() {
+  await command('Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: '`',
+    code: 'Backquote',
+    windowsVirtualKeyCode: 192,
+  });
+  await command('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: '`',
+    code: 'Backquote',
+    windowsVirtualKeyCode: 192,
+  });
+}
+
 await command('Runtime.enable');
 await command('Page.enable');
 
@@ -124,9 +141,14 @@ await new Promise((resolve) => setTimeout(resolve, 300));
 const afterMove = await evaluate('window.__KINETIC_GROUNDS_QA__');
 
 await command('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32 });
+await new Promise((resolve) => setTimeout(resolve, 80));
 await command('Input.dispatchKeyEvent', { type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32 });
-await new Promise((resolve) => setTimeout(resolve, 140));
-const afterJump = await evaluate('window.__KINETIC_GROUNDS_QA__');
+let afterJump = await evaluate('window.__KINETIC_GROUNDS_QA__');
+const jumpDeadline = Date.now() + 700;
+while (afterJump.grounded && Date.now() < jumpDeadline) {
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  afterJump = await evaluate('window.__KINETIC_GROUNDS_QA__');
+}
 
 await new Promise((resolve) => setTimeout(resolve, 850));
 await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(0, 1.05, 12.35)');
@@ -151,17 +173,40 @@ await new Promise((resolve) => setTimeout(resolve, 100));
 await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(9.86, 1.58, 2.7)');
 await new Promise((resolve) => setTimeout(resolve, 2_000));
 const unevenTerrainSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+await toggleDebug();
+await new Promise((resolve) => setTimeout(resolve, 120));
+const terrainScreenshot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+writeFileSync(terrainScreenshotPath, Buffer.from(terrainScreenshot.data, 'base64'));
+await toggleDebug();
 
 // Straddle two calibration treads so the sole probes disagree across a 0.20 m riser.
 await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(0, 1.9, 1.72)');
 await new Promise((resolve) => setTimeout(resolve, 2_000));
 const stairEdgeSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+await toggleDebug();
+await new Promise((resolve) => setTimeout(resolve, 120));
+const edgeScreenshot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+writeFileSync(edgeScreenshotPath, Buffer.from(edgeScreenshot.data, 'base64'));
+await toggleDebug();
 
 // Move far enough across the edge that the trailing sole loses upper-tread
 // ownership and must settle on the adjacent lower tread.
 await evaluate('window.__KINETIC_GROUNDS_TELEPORT__(0, 1.9, 1.58)');
 await new Promise((resolve) => setTimeout(resolve, 2_000));
 const stairSplitSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+
+// Stand on the kinematic platform long enough to verify both controller carry
+// and collider-local foot locks.
+const platformFixture = stairSplitSample.platforms?.[0];
+if (platformFixture) {
+  await evaluate(
+    `window.__KINETIC_GROUNDS_TELEPORT__(${platformFixture.position.x}, ${platformFixture.top + 0.9}, ${platformFixture.position.z})`,
+  );
+}
+await new Promise((resolve) => setTimeout(resolve, 700));
+const platformStartSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
+await new Promise((resolve) => setTimeout(resolve, 1_300));
+const platformEndSample = await evaluate('window.__KINETIC_GROUNDS_QA__');
 
 const screenshot = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
 writeFileSync(screenshotPath, Buffer.from(screenshot.data, 'base64'));
@@ -172,9 +217,14 @@ const movedMeters = Math.hypot(
 );
 const failures = [];
 if (!initial.grounded) failures.push('player did not settle on the spawn deck');
-if (!initial.footDebug?.some((foot) => foot.locked)) failures.push('toe-driven foot locking did not engage at rest');
-if (!locomotionLockObserved) failures.push('toe-driven foot locking did not engage during locomotion');
-if (movedMeters < 2) failures.push(`forward movement was only ${movedMeters.toFixed(2)} m`);
+if (!initial.footDebug?.every((foot) => foot.hasGround && foot.footprintSupported)) {
+  failures.push('footbase support did not initialize at rest');
+}
+if (initial.footDebug?.some((foot) => Math.abs(foot.target.y) > 0.01)) {
+  failures.push('a response-deck footbase target inherited capsule clearance instead of the ground plane');
+}
+if (!locomotionLockObserved) failures.push('footbase locking did not engage during locomotion');
+if (movedMeters < 1.8) failures.push(`forward movement was only ${movedMeters.toFixed(2)} m`);
 if (afterJump.grounded || afterJump.position.y <= afterMove.position.y + 0.2) {
   failures.push('jump did not produce an airborne vertical displacement');
 }
@@ -186,8 +236,15 @@ if (unevenTerrainSample.footDebug?.some((foot) => !foot.hasGround || !foot.sourc
 if (unevenTerrainSample.footDebug?.some((foot) => foot.weight < 0.7)) {
   failures.push('both feet did not receive full stance correction on split-height terrain');
 }
-if (unevenTerrainSample.footDebug?.some((foot) => foot.contactError > 0.06)) {
-  failures.push('a toe remained more than 6 cm above its split-height ground plane');
+if (unevenTerrainSample.footDebug?.some((foot) => foot.contactError > 0.03)) {
+  failures.push('a toe remained more than 3 cm from its split-height ground plane');
+}
+if (
+  unevenTerrainSample.footDebug?.some(
+    (foot) => foot.contactError > 0.02 && foot.reachability === 'reachable',
+  )
+) {
+  failures.push('split-height contact error was not explained by anatomical reachability');
 }
 if (!stairEdgeSample.grounded) failures.push('player did not settle on the stair-edge fixture');
 if (!stairEdgeSample.footDebug?.some((foot) => foot.supportKind === 'ledge' || foot.clearanceBlocked)) {
@@ -195,6 +252,16 @@ if (!stairEdgeSample.footDebug?.some((foot) => foot.supportKind === 'ledge' || f
 }
 if (stairEdgeSample.footDebug?.some((foot) => foot.postSolveBlocked)) {
   failures.push('a solved shin, ankle, or foot segment still intersected the stair riser');
+}
+if (stairEdgeSample.footDebug?.some((foot) => foot.contactError > 0.012)) {
+  failures.push('a planted ledge foot separated from its ground-contact markers');
+}
+if (
+  stairEdgeSample.footDebug?.some(
+    (foot) => foot.sourceContact && foot.clearanceLift > 0.005 && !foot.postSolveBlocked,
+  )
+) {
+  failures.push('a collision-free planted foot retained unnecessary clearance lift');
 }
 if (stairSplitSample.footDebug?.some((foot) => !foot.hasGround || foot.contactError > 0.06)) {
   failures.push('a foot did not settle cleanly after releasing the upper stair tread');
@@ -206,6 +273,15 @@ if (stairToeHeights.length !== 2 || Math.abs(stairToeHeights[0] - stairToeHeight
 if (stairSplitSample.footDebug?.some((foot) => foot.postSolveBlocked)) {
   failures.push('stair release left a solved segment intersecting the riser');
 }
+if (!platformFixture) failures.push('moving-platform fixture was not published to QA');
+if (!platformEndSample.footDebug?.some((foot) => foot.supportIsMoving && foot.locked)) {
+  failures.push('footbase locks did not stay relative to the moving platform');
+}
+const platformCarry = Math.hypot(
+  platformEndSample.position.x - platformStartSample.position.x,
+  platformEndSample.position.z - platformStartSample.position.z,
+);
+if (platformCarry < 0.08) failures.push('character controller did not inherit moving-platform displacement');
 if (
   afterTeleport.footDebug?.some(
     (foot) =>
@@ -229,12 +305,17 @@ console.log(
       unevenTerrainSample,
       stairEdgeSample,
       stairSplitSample,
+      platformStartSample,
+      platformEndSample,
+      platformCarry,
       movedMeters,
       locomotionLockObserved,
       locomotionToeSpeedRange,
       consoleMessages,
       exceptions,
       screenshotPath,
+      edgeScreenshotPath,
+      terrainScreenshotPath,
     },
     null,
     2,

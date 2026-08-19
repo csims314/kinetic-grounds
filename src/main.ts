@@ -36,6 +36,7 @@ interface QaSnapshot {
   triangles: number;
   handDebug: AnimatedCharacter['handDebug'];
   footDebug: AnimatedCharacter['footDebug'];
+  platforms: Course['movingPlatformDebug'];
 }
 
 const qaWindow = window as Window & {
@@ -242,7 +243,10 @@ async function bootstrap(): Promise<void> {
         resetPressed: false,
         debugPressed: false,
       };
-      snapshot = motor.simulate(fixedDt, simulationInput, cameraRig.yaw);
+      course.preparePhysicsStep(fixedDt);
+      const supportDisplacement = course.platformDisplacementAt(snapshot.position, snapshot.grounded);
+      snapshot = motor.simulate(fixedDt, simulationInput, cameraRig.yaw, supportDisplacement);
+      course.syncKinematicVisuals();
       if (firstStep && jumpQueued) jumpQueued = false;
       firstStep = false;
       accumulator -= fixedDt;
@@ -278,6 +282,7 @@ async function bootstrap(): Promise<void> {
       triangles: renderer.info.render.triangles,
       handDebug: character.handDebug,
       footDebug: character.footDebug,
+      platforms: course.movingPlatformDebug,
     };
 
     hudTimer += frameDt;
@@ -306,6 +311,7 @@ bootstrap().catch((error: unknown) => {
     triangles: 0,
     handDebug: [],
     footDebug: [],
+    platforms: [],
   };
   console.error(error);
 });

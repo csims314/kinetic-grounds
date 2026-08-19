@@ -1,14 +1,47 @@
 import { describe, expect, it } from 'vitest';
 import {
   cubicDecayCoefficients,
+  footbaseBalance,
   hasContactMajority,
   isSourceFootContact,
   selectFootSupport,
+  solveFootbase,
+  solveLimbReach,
   softClampExtension,
   solvePelvisReachOffset,
 } from './ik';
+import { Vector3 } from 'three';
 
 describe('IK utilities', () => {
+  it('chooses the lower heel or toe as the dominant footbase pivot', () => {
+    const heelLower = footbaseBalance(0, 0.2, 0.28, 1);
+    const toeLower = footbaseBalance(0.2, 0, 0.28, 1);
+    expect(heelLower).toBeLessThan(0.5);
+    expect(toeLower).toBeGreaterThan(0.5);
+
+    const footbase = solveFootbase(
+      new Vector3(0, 0, 0),
+      new Vector3(0, 0, 0.28),
+      0,
+      0.2,
+      0.28,
+      1,
+    );
+    expect(footbase.pivot.z).toBeLessThan(0.14);
+  });
+
+  it('reports both unreachable bounds while returning safe solve distances', () => {
+    const reachable = solveLimbReach(0.75, 0.45, 0.45, 0.897, 0.008);
+    const tooFar = solveLimbReach(1.2, 0.45, 0.45, 0.897, 0.008);
+    const tooClose = solveLimbReach(0.01, 0.55, 0.35, 0.897, 0.008);
+
+    expect(reachable.status).toBe('reachable');
+    expect(tooFar.status).toBe('tooFar');
+    expect(tooFar.solvedDistance).toBeLessThanOrEqual(tooFar.maximumDistance);
+    expect(tooClose.status).toBe('tooClose');
+    expect(tooClose.solvedDistance).toBeCloseTo(tooClose.minimumDistance);
+  });
+
   it('soft-clamps extension without changing ordinary reach', () => {
     expect(softClampExtension(0.8, 1, 0.01)).toBeCloseTo(0.8);
     expect(softClampExtension(0.99, 1, 0.01)).toBeCloseTo(0.99);
@@ -132,8 +165,7 @@ describe('IK utilities', () => {
       0.58,
       0.1,
     );
-    expect(offset).toBeLessThan(-0.5);
-    expect(offset).toBeGreaterThanOrEqual(-0.58);
+    expect(offset).toBeCloseTo(-0.58);
   });
 
   it('keeps a level reachable stance unchanged and bounds impossible corrections', () => {
@@ -157,5 +189,31 @@ describe('IK utilities', () => {
       0.1,
     );
     expect(impossible).toBe(0.1);
+  });
+
+  it('assigns an impossible pelvis compromise to the lower-confidence contact', () => {
+    const offset = solvePelvisReachOffset(
+      [
+        {
+          hipY: 1,
+          targetY: 0,
+          horizontalDistance: 0,
+          preferredLength: 0.4,
+          maximumLength: 0.4,
+          priority: 1,
+        },
+        {
+          hipY: 1,
+          targetY: 2,
+          horizontalDistance: 0,
+          preferredLength: 0.4,
+          maximumLength: 0.4,
+          priority: 10,
+        },
+      ],
+      1,
+      1,
+    );
+    expect(offset).toBeGreaterThan(0.4);
   });
 });

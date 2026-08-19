@@ -58,7 +58,12 @@ export class CharacterMotor {
     this.position.copy(spawn);
   }
 
-  simulate(dt: number, input: InputFrame, cameraYaw: number): MotorSnapshot {
+  simulate(
+    dt: number,
+    input: InputFrame,
+    cameraYaw: number,
+    supportDisplacement?: Vector3,
+  ): MotorSnapshot {
     const c = CONFIG.motor;
     if (input.jumpPressed) this.jumpBuffered = c.jumpBuffer;
     else this.jumpBuffered = Math.max(0, this.jumpBuffered - dt);
@@ -102,9 +107,9 @@ export class CharacterMotor {
 
     const current = this.body.translation();
     const desired = {
-      x: this.planarVelocity.x * dt,
-      y: this.verticalVelocity * dt,
-      z: this.planarVelocity.y * dt,
+      x: this.planarVelocity.x * dt + (supportDisplacement?.x ?? 0),
+      y: this.verticalVelocity * dt + (supportDisplacement?.y ?? 0),
+      z: this.planarVelocity.y * dt + (supportDisplacement?.z ?? 0),
     };
     this.controller.computeColliderMovement(this.collider, desired);
     const corrected = this.controller.computedMovement();

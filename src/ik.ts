@@ -1,4 +1,21 @@
-import { MathUtils } from 'three';
+import { MathUtils, Vector3 } from 'three';
+
+export type LimbReachability = 'reachable' | 'tooClose' | 'tooFar';
+
+export interface LimbReachResult {
+  status: LimbReachability;
+  requestedDistance: number;
+  solvedDistance: number;
+  minimumDistance: number;
+  maximumDistance: number;
+  extensionRatio: number;
+  unmetDistance: number;
+}
+
+export interface FootbaseResult {
+  balance: number;
+  pivot: Vector3;
+}
 
 export interface CubicDecayCoefficients {
   positionFromOffset: number;
@@ -13,6 +30,80 @@ export interface LegReachConstraint {
   horizontalDistance: number;
   preferredLength: number;
   maximumLength: number;
+  priority?: number;
+}
+
+/**
+ * Classifies both degeneracies of an analytic two-bone chain and computes a
+ * singularity-safe distance. The status always describes the original target,
+ * even when the returned distance has been softened or clamped.
+ */
+export function solveLimbReach(
+  requestedDistance: number,
+  upperLength: number,
+  lowerLength: number,
+  maximumExtension: number,
+  softness: number,
+): LimbReachResult {
+  const upper = Math.max(0, upperLength);
+  const lower = Math.max(0, lowerLength);
+  const geometricMaximum = Math.max(0.001, upper + lower - 0.003);
+  const minimumDistance = Math.min(
+    geometricMaximum,
+    Math.abs(upper - lower) + 0.001,
+  );
+  const maximumDistance = MathUtils.clamp(
+    maximumExtension,
+    minimumDistance,
+    geometricMaximum,
+  );
+  const requested = Math.max(0, requestedDistance);
+  const status: LimbReachability =
+    requested < minimumDistance
+      ? 'tooClose'
+      : requested > maximumDistance
+        ? 'tooFar'
+        : 'reachable';
+  const softened = softClampExtension(requested, maximumDistance, softness);
+  const solvedDistance = MathUtils.clamp(softened, minimumDistance, geometricMaximum);
+
+  return {
+    status,
+    requestedDistance: requested,
+    solvedDistance,
+    minimumDistance,
+    maximumDistance,
+    extensionRatio: maximumDistance > 0 ? solvedDistance / maximumDistance : 0,
+    unmetDistance: Math.abs(requested - solvedDistance),
+  };
+}
+
+/** Johansen-style heel/toe balance used to choose the stance footbase pivot. */
+export function footbaseBalance(
+  heelHeight: number,
+  toeHeight: number,
+  footLength: number,
+  alpha = 20,
+): number {
+  const denominator = Math.max(0.0001, Math.abs(footLength) * Math.max(0.0001, alpha));
+  return MathUtils.clamp(Math.atan((heelHeight - toeHeight) / denominator) / Math.PI + 0.5, 0, 1);
+}
+
+/** A balance of zero pivots at the heel; one pivots at the toe. */
+export function solveFootbase(
+  heelPosition: Vector3,
+  toePosition: Vector3,
+  heelHeight: number,
+  toeHeight: number,
+  footLength: number,
+  alpha = 20,
+  target = new Vector3(),
+): FootbaseResult {
+  const balance = footbaseBalance(heelHeight, toeHeight, footLength, alpha);
+  return {
+    balance,
+    pivot: target.copy(heelPosition).lerp(toePosition, balance),
+  };
 }
 
 export interface FootSupportSample {
@@ -185,7 +276,21 @@ function solveIntervals(
   if (minimum <= maximum) {
     return { offset: MathUtils.clamp(0, minimum, maximum), intersects: true };
   }
-  return { offset: (minimum + maximum) * 0.5, intersects: false };
+
+  // When both contacts cannot be satisfied, bias the compromise toward the
+  // higher-confidence foot instead of distorting both legs equally.
+  const lowerOwner = constraints
+    .map((constraint) => ({ constraint, interval: reachInterval(constraint, useMaximumLength) }))
+    .reduce((best, candidate) => candidate.interval.minimum > best.interval.minimum ? candidate : best);
+  const upperOwner = constraints
+    .map((constraint) => ({ constraint, interval: reachInterval(constraint, useMaximumLength) }))
+    .reduce((best, candidate) => candidate.interval.maximum < best.interval.maximum ? candidate : best);
+  const lowerWeight = Math.max(0.001, lowerOwner.constraint.priority ?? 1);
+  const upperWeight = Math.max(0.001, upperOwner.constraint.priority ?? 1);
+  return {
+    offset: (minimum * lowerWeight + maximum * upperWeight) / (lowerWeight + upperWeight),
+    intersects: false,
+  };
 }
 
 /** Finds the smallest vertical pelvis correction that makes every active leg reachable. */

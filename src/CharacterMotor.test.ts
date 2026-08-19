@@ -53,4 +53,17 @@ describe('CharacterMotor', () => {
     expect(snapshot.position.x).toBeLessThan(-3);
     expect(Math.abs(snapshot.position.z)).toBeLessThan(0.1);
   });
+
+  it('inherits support displacement from a moving platform', async () => {
+    await RAPIER.init();
+    const world = new RAPIER.World({ x: 0, y: -18, z: 0 });
+    const floorBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0));
+    world.createCollider(RAPIER.ColliderDesc.cuboid(20, 0.5, 20), floorBody);
+    const motor = new CharacterMotor(world, new Vector3(0, 1.05, 0));
+    for (let i = 0; i < 90; i += 1) motor.simulate(1 / 60, frame(), 0);
+
+    const before = motor.snapshot().position.x;
+    const after = motor.simulate(1 / 60, frame(), 0, new Vector3(0.08, 0, 0));
+    expect(after.position.x - before).toBeCloseTo(0.08, 3);
+  });
 });

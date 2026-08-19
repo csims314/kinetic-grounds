@@ -16,13 +16,15 @@ import {
   TorusGeometry,
   Vector3,
 } from 'three';
-import { PALETTE } from './config';
+import { CONFIG, PALETTE } from './config';
 
-export type SurfaceKind = 'ground' | 'step' | 'ramp' | 'contact' | 'landing';
+export type SurfaceKind = 'ground' | 'step' | 'ramp' | 'contact' | 'landing' | 'platform';
 
 export interface SurfaceMetadata {
   kind: SurfaceKind;
   handContact: boolean;
+  ikSupport: boolean;
+  ikOnly: boolean;
   name: string;
 }
 
@@ -34,8 +36,30 @@ interface BoxDescriptor {
   color?: number;
   surface?: SurfaceKind;
   handContact?: boolean;
+  ikSupport?: boolean;
+  ikOnly?: boolean;
   collider?: boolean;
   edges?: boolean;
+  visible?: boolean;
+  motion?: {
+    axis: [number, number, number];
+    amplitude: number;
+    speed: number;
+    phase?: number;
+  };
+}
+
+interface MovingSurface {
+  mesh: Mesh;
+  body: RAPIER.RigidBody;
+  basePosition: Vector3;
+  halfExtents: Vector3;
+  axis: Vector3;
+  amplitude: number;
+  speed: number;
+  phase: number;
+  previousPosition: Vector3;
+  nextPosition: Vector3;
 }
 
 const materialCache = new Map<number, MeshStandardMaterial>();
@@ -59,6 +83,9 @@ export class Course {
   readonly surfaces = new Map<number, SurfaceMetadata>();
   readonly handContactHandles = new Set<number>();
   readonly spawn = new Vector3(0, 1.05, -16);
+  private readonly movingSurfaces: MovingSurface[] = [];
+  private readonly platformDisplacement = new Vector3();
+  private simulationTime = 0;
 
   constructor(scene: Scene, readonly world: RAPIER.World) {
     this.group.name = 'Abstract locomotion course';
@@ -70,8 +97,66 @@ export class Course {
     return this.handContactHandles.has(collider.handle);
   }
 
+  isFootSupport(collider: RAPIER.Collider): boolean {
+    return this.surfaces.get(collider.handle)?.ikSupport ?? false;
+  }
+
   surfaceFor(collider: RAPIER.Collider | null): SurfaceMetadata | undefined {
     return collider ? this.surfaces.get(collider.handle) : undefined;
+  }
+
+  preparePhysicsStep(dt: number): void {
+    this.simulationTime += dt;
+    for (const surface of this.movingSurfaces) {
+      surface.previousPosition.copy(surface.nextPosition);
+      surface.nextPosition
+        .copy(surface.basePosition)
+        .addScaledVector(
+          surface.axis,
+          Math.sin(this.simulationTime * surface.speed + surface.phase) * surface.amplitude,
+        );
+      surface.body.setNextKinematicTranslation(surface.nextPosition);
+    }
+  }
+
+  platformDisplacementAt(position: Vector3, grounded: boolean, target?: Vector3): Vector3 {
+    const output = target ?? this.platformDisplacement;
+    output.set(0, 0, 0);
+    if (!grounded) return output;
+    for (const surface of this.movingSurfaces) {
+      const top = surface.previousPosition.y + surface.halfExtents.y;
+      const feetY = position.y - CONFIG.motor.capsuleHalfHeight - CONFIG.motor.capsuleRadius;
+      if (
+        Math.abs(position.x - surface.previousPosition.x) <= surface.halfExtents.x + 0.2 &&
+        Math.abs(position.z - surface.previousPosition.z) <= surface.halfExtents.z + 0.2 &&
+        feetY >= top - 0.12 &&
+        feetY <= top + 0.18
+      ) {
+        return output.copy(surface.nextPosition).sub(surface.previousPosition);
+      }
+    }
+    return output;
+  }
+
+  syncKinematicVisuals(): void {
+    for (const surface of this.movingSurfaces) {
+      const translation = surface.body.translation();
+      surface.mesh.position.set(translation.x, translation.y, translation.z);
+    }
+  }
+
+  get movingPlatformDebug(): Array<{
+    position: { x: number; y: number; z: number };
+    top: number;
+  }> {
+    return this.movingSurfaces.map((surface) => ({
+      position: {
+        x: surface.nextPosition.x,
+        y: surface.nextPosition.y,
+        z: surface.nextPosition.z,
+      },
+      top: surface.nextPosition.y + surface.halfExtents.y,
+    }));
   }
 
   private addBox(descriptor: BoxDescriptor): Mesh {
@@ -83,6 +168,7 @@ export class Course {
     mesh.name = name;
     mesh.position.set(...position);
     mesh.rotation.set(...rotation);
+    mesh.visible = descriptor.visible ?? !descriptor.ikOnly;
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     this.group.add(mesh);
@@ -98,24 +184,44 @@ export class Course {
 
     if (descriptor.collider !== false) {
       const quaternion = new Quaternion().setFromEuler(new Euler(...rotation));
+      const bodyDescriptor = descriptor.motion
+        ? RAPIER.RigidBodyDesc.kinematicPositionBased()
+        : RAPIER.RigidBodyDesc.fixed();
       const body = this.world.createRigidBody(
-        RAPIER.RigidBodyDesc.fixed()
+        bodyDescriptor
           .setTranslation(...position)
           .setRotation(quaternion),
       );
-      const collider = this.world.createCollider(
-        RAPIER.ColliderDesc.cuboid(size[0] / 2, size[1] / 2, size[2] / 2)
+      const colliderDesc = RAPIER.ColliderDesc.cuboid(size[0] / 2, size[1] / 2, size[2] / 2)
           .setFriction(1.1)
-          .setRestitution(0),
-        body,
-      );
+          .setRestitution(0);
+      if (descriptor.ikOnly) colliderDesc.setSensor(true);
+      const collider = this.world.createCollider(colliderDesc, body);
       const metadata: SurfaceMetadata = {
         kind: descriptor.surface ?? 'ground',
         handContact: descriptor.handContact ?? false,
+        ikSupport: descriptor.ikSupport ?? true,
+        ikOnly: descriptor.ikOnly ?? false,
         name,
       };
       this.surfaces.set(collider.handle, metadata);
       if (metadata.handContact) this.handContactHandles.add(collider.handle);
+      if (descriptor.motion) {
+        const axis = new Vector3(...descriptor.motion.axis).normalize();
+        const basePosition = new Vector3(...position);
+        this.movingSurfaces.push({
+          mesh,
+          body,
+          basePosition,
+          halfExtents: new Vector3(size[0] / 2, size[1] / 2, size[2] / 2),
+          axis,
+          amplitude: descriptor.motion.amplitude,
+          speed: descriptor.motion.speed,
+          phase: descriptor.motion.phase ?? 0,
+          previousPosition: basePosition.clone(),
+          nextPosition: basePosition.clone(),
+        });
+      }
     }
     return mesh;
   }
@@ -223,6 +329,18 @@ export class Course {
         color: index % 3 === 0 ? PALETTE.blue : PALETTE.concrete,
         surface: 'step',
       });
+    });
+    this.addBox({
+      name: 'Moving foot-lock platform',
+      position: [8.1, 0.32, 6.8],
+      size: [3.2, 0.36, 2.4],
+      color: PALETTE.acid,
+      surface: 'platform',
+      motion: {
+        axis: [1, 0, 0],
+        amplitude: 1.15,
+        speed: 0.72,
+      },
     });
 
     // 03 — a shoulder-width contact channel for contextual hand IK.
